@@ -31,6 +31,9 @@
    device, etc.  Everything is very lightly tested and a work in
    progress.  Read the source and use with caution.
    
+   This program MUST NOT be localized. We have to use strerror in the same
+   locale as the phone, which seems to always be in the C locale.
+   (Please don't ask, it makes me cry)
 */
 
 /*
@@ -340,6 +343,25 @@ int strmode_to_rawmode(const string& str) {
 }
 
 
+int strerror_to_errno(const string &str) {
+	// Use rfind instead of find in case the message ever contains the
+	// separator character
+	std::size_t found = str.rfind(":",std::string::npos);
+	if (found == std::string::npos)
+		found = str.rfind(",",std::string::npos);
+	if (found != std::string::npos) {
+		int ii = 0;
+		do {
+			if (str.substr(found+2,std::string::npos) /* 2 = ': ' */
+			    .compare(strerror(ii)) == 0) {
+				return -ii;
+			}
+			ii++;
+		} while (memcmp(strerror(ii),"Unknown error",13) != 0 && ii < 512);
+	}
+	return -EAGAIN;
+}
+
 
 static int adb_getattr(const char *path, struct stat *stbuf)
 {
@@ -362,6 +384,11 @@ static int adb_getattr(const char *path, struct stat *stbuf)
         command.append("\"");
         output = adb_shell(command);
         if (output.empty()) return -EAGAIN; /* no phone */
+        /* If adb wasn't running, we'll get the message "* daemon..." */
+        if (output.front().length() < 3) return -EAGAIN;
+        if (output.front().c_str()[1] != 'r' &&
+            output.front().c_str()[1] != '-')
+	        return strerror_to_errno(output.front());
         output_chunk = make_array(output.front());
         fileData[path_string].statOutput = output.front();
         fileData[path_string].timestamp = time(NULL);
@@ -536,7 +563,8 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     */
     if (output.front().length() < 3) return -ENOENT;
     if (output.front().c_str()[1] != 'r' &&
-        output.front().c_str()[1] != '-') return -ENOENT;
+        output.front().c_str()[1] != '-')
+	    return strerror_to_errno(output.front());
 
     while (output.size() > 0) {
         const string& fname_l_t = output.front().substr(54); 
@@ -576,6 +604,10 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
         command.append("\"");
         cout << command<<"\n";
         output = adb_shell(command);
+        if (output.empty()) return -EAGAIN;
+        if (output.front().length() < 3) return -ENOENT;
+        if (output.front().c_str()[1] != 'r' &&
+            output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
         vector<string> output_chunk = make_array(output.front());
         if (output_chunk[0][0] == '/') {
             return -ENOENT;
@@ -674,6 +706,7 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
     local_path_string.append(path_string);
     path_string.assign(path);
 
+    // Missing on android 2.3
     queue<string> output;
     string command = "touch \"";
     command.append(path_string);
@@ -700,6 +733,10 @@ static int adb_truncate(const char *path, off_t size) {
     command.append("\"");
     cout << command<<"\n";
     output = adb_shell(command);
+    if (output.empty()) return -EAGAIN;
+    if (output.front().length() < 3) return -EAGAIN;
+    if (output.front().c_str()[1] != 'r' &&
+        output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
     vector<string> output_chunk = make_array(output.front());
     if (output_chunk[0][0] == '/'){
         adb_pull(path_string,local_path_string);
@@ -778,7 +815,7 @@ static int adb_rmdir(const char *path) {
     local_path_string.append(path_string);
     path_string.assign(path);
 
-    string command = "rm -r '";
+    string command = "rmdir '";
     command.append(path_string);
     command.append("'");
     adb_shell(command);
@@ -830,6 +867,9 @@ static int adb_readlink(const char *path, char *buf, size_t size)
         output = adb_shell(command);
         if (output.empty()) 
             return -EINVAL; 
+        if (output.front().length() < 3) return -EAGAIN;
+        if (output.front().c_str()[1] != 'r' &&
+            output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
         res = output.front();
         fileData[path_string].statOutput = output.front();
         fileData[path_string].timestamp = time(NULL);
@@ -895,6 +935,5 @@ int main(int argc, char *argv[])
     adbfs_oper.rmdir = adb_rmdir;
     adbfs_oper.unlink = adb_unlink;
     adbfs_oper.readlink = adb_readlink;
-    adb_shell("ls");
     return fuse_main(argc, argv, &adbfs_oper, NULL);
 }
