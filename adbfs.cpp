@@ -407,8 +407,7 @@ static int adb_getattr(const char *path, struct stat *stbuf)
         if (output.empty()) return -EAGAIN; /* no phone */
         /* If adb wasn't running, we'll get the message "* daemon..." */
         if (output.front().length() < 3) return -EAGAIN;
-        if (output.front().c_str()[1] != 'r' &&
-            output.front().c_str()[1] != '-')
+        if (!check_exists(output.front()))
 	        return strerror_to_errno(output.front());
         output_chunk = make_array(output.front());
         fileData[path_string].statOutput = output.front();
@@ -610,8 +609,8 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
         output = adb_shell(command);
         if (output.empty()) return -EAGAIN;
         if (output.front().length() < 3) return -ENOENT;
-        if (output.front().c_str()[1] != 'r' &&
-            output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
+        if (!check_exists(output.front()))
+          return strerror_to_errno(output.front());
         vector<string> output_chunk = make_array(output.front());
         if (!check_exists(output_chunk[0])) {
           return -ENOENT;
@@ -750,8 +749,8 @@ static int adb_truncate(const char *path, off_t size) {
     output = adb_shell(command);
     if (output.empty()) return -EAGAIN;
     if (output.front().length() < 3) return -EAGAIN;
-    if (output.front().c_str()[1] != 'r' &&
-        output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
+    if (!check_exists(output.front()))
+        return strerror_to_errno(output.front());
     vector<string> output_chunk = make_array(output.front());
     if (output_chunk[0][0] == '/'){
         adb_pull(path_string,local_path_string);
@@ -908,8 +907,8 @@ static int adb_readlink(const char *path, char *buf, size_t size)
         if (output.empty()) 
             return -EINVAL; 
         if (output.front().length() < 3) return -EAGAIN;
-        if (output.front().c_str()[1] != 'r' &&
-            output.front().c_str()[1] != '-') return strerror_to_errno(output.front());
+        if (!check_exists(output.front()))
+            return strerror_to_errno(output.front());
         res = output.front();
         fileData[path_string].statOutput = output.front();
         fileData[path_string].timestamp = time(NULL);
