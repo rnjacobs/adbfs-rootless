@@ -367,7 +367,7 @@ bool check_exists(const string& file) {
   /* The specific error messages we are looking for (from the android source)-
      (in listdir) "opendir failed, strerror"
      (in show_total_size) "stat failed on filename, strerror"
-     (in listfile_size) "lstat 'filename' failed: strerror"
+     (in listfile_size and listfile) "(l)stat 'filename' failed: strerror"
 
      Thus, we can abuse this a little and just make sure that the second
      character is either "r" or "-", and assume it's an error otherwise.
@@ -405,6 +405,7 @@ static int adb_getattr(const char *path, struct stat *stbuf)
         command.append("'");
         output = adb_shell(command);
         if (output.empty()) return -EAGAIN; /* no phone */
+        if (output.front().compare(0,7,"error: ") == 0) return -EAGAIN;
         /* If adb wasn't running, we'll get the message "* daemon..." */
         if (output.front().length() < 3) return -EAGAIN;
         if (!check_exists(output.front()))
@@ -481,7 +482,7 @@ static int adb_getattr(const char *path, struct stat *stbuf)
     }
 
     stbuf->st_blksize = 0; // TODO: THIS IS SMELLY
-    stbuf->st_blocks = 1;
+    stbuf->st_blocks = (stbuf->st_size+511)/512;
 
     //for (int k = 0; k < output_chunk.size(); ++k) cout << output_chunk[k] << " ";    
     //cout << endl;
@@ -553,33 +554,72 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     command.append("'");
     output = adb_shell(command);
     if (!output.size()) return 0;
+    if (output.front().compare(0,7,"error: ") == 0) return -EAGAIN;
     /* cannot tell between "no phone" and "empty directory" */
     vector<string> output_chunk = make_array(output.front());
 
+    
     if (output.front().length() < 3) return -ENOENT;
-    if (!check_exists(output.front())) {
+    /* check if we get an error specifically about the file we're opening
+     *
+     * this means, look for
+     * (in show_total_size) "stat failed on filename, strerror"
+     * (in listfile_size) "lstat 'filename' failed: strerror"
+     * (in listdir) "opendir failed, strerror"
+     */
+    if (output.front().compare(0,15,"stat failed on ") == 0 &&
+        output.front().compare(15,strlen(path),path) == 0 &&
+        output.front().compare(15+strlen(path),2,", ") == 0) // more robust would be nice
 	    return strerror_to_errno(output.front());
-        return -ENOENT;
-    }
+
+    if (output.front().find("stat '") != string::npos && // look for both "stat '" and "lstat '"
+        output.front().compare(7,strlen(path),path) == 0 &&
+        output.front().compare(7+strlen(path),10,"' failed: ") == 0)
+	    return strerror_to_errno(output.front());
+
+    if (output.front().compare(0,16,"opendir failed, ") == 0)
+	    return strerror_to_errno(output.front());
+
     while (output.size() > 0) {
-        // Start of filename = `ls -la` time separator + 3
-        size_t nameStart = output.front().find_first_of(":") + 3;
-        const string& fname_l_t = output.front().substr(nameStart);
-        const string& fname_l = fname_l_t.substr(find_nth(1, " ",fname_l_t));
-        const string& fname_n = fname_l.substr(0, fname_l.find(" -> "));
-        filler(buf, fname_n.c_str(), NULL, 0);
-        const string& path_string_c = path_string 
-            + (path_string == "/" ? "" : "/") + fname_n;
+	    // Specific files can fail, so check_exists each entry!
+	    if (check_exists(output.front())) {
+		    // Start of filename = `ls -la` time separator + 3
+		    size_t nameStart = output.front().find_first_of(":") + 3;
+		    const string& fname_l_t = output.front().substr(nameStart);
+		    const string& fname_l = fname_l_t.substr(find_nth(1, " ",fname_l_t));
+	        const string& fname_n = fname_l.substr(0, fname_l.find(" -> "));
+	        filler(buf, fname_n.c_str(), NULL, 0);
+	        const string& path_string_c = path_string 
+		        + (path_string == "/" ? "" : "/") + fname_n;
 
-        cout << "caching " << path_string_c << " = " << output.front() <<  endl;
-        fileData[path_string_c].statOutput = output.front(); 
-        fileData[path_string_c].timestamp = time(NULL);
-        cout << "cached " << endl;
+	        cout << "caching " << path_string_c << " = " << output.front() <<  endl;
+	        fileData[path_string_c].statOutput = output.front(); 
+	        fileData[path_string_c].timestamp = time(NULL);
+	        //cout << "cached " << endl;
+        } else {
+	        if (strerror_to_errno(output.front()) == -EACCES) {
+			        // Cache a file we can't access? how?
+			        // Fake an empty "ls -l -a" output?
+			        //   ?--------- root root 1969-12-31 16:00 filename
+			        if (output.front().compare(0,7,"lstat '") == 0) {
+				        size_t found = output.front().rfind("'",std::string::npos);
+				        if (found != std::string::npos && found > 7) {
+					        const string& fname_n = output.front().substr(7,found-7);
+					        const string& basename_n = fname_n.substr(1+fname_n.rfind("/",std::string::npos));
+					        filler(buf, basename_n.c_str(), NULL, 0);
+					        fileData[fname_n].statOutput = "?--------- root root 1970-01-01 00:00 "+basename_n;
+					        fileData[fname_n].timestamp = time(NULL);
+					        cout << "cached " << basename_n << " as unstat-able (" << fileData[fname_n].statOutput << ";" << output.front() << ")" << endl;
+				        }
+			        }
+					        // look for last ' to find filename
+			        if (output.front().find("stat failed on ") == 0);
+			        // look for last , to find filename
+	        }
+        }
         output.pop();
-
+        
     }
-
-
     return 0;
 }
 
@@ -608,6 +648,7 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
         cout << command<<"\n";
         output = adb_shell(command);
         if (output.empty()) return -EAGAIN;
+        if (output.front().compare(0,7,"error: ") == 0) return -EAGAIN;
         if (output.front().length() < 3) return -ENOENT;
         if (!check_exists(output.front()))
           return strerror_to_errno(output.front());
@@ -748,6 +789,7 @@ static int adb_truncate(const char *path, off_t size) {
     cout << command << "\n";
     output = adb_shell(command);
     if (output.empty()) return -EAGAIN;
+    if (output.front().compare(0,7,"error: ") == 0) return -EAGAIN;
     if (output.front().length() < 3) return -EAGAIN;
     if (!check_exists(output.front()))
         return strerror_to_errno(output.front());
@@ -892,7 +934,7 @@ static int adb_readlink(const char *path, char *buf, size_t size)
     string res;
 
     // get the number of slashes in the path
-    int num_slashes, ii;
+    unsigned int num_slashes, ii;
     for (num_slashes = ii = 0; ii < strlen(path); ii++)
         if (path[ii] == '/')
             num_slashes++;
@@ -907,6 +949,7 @@ static int adb_readlink(const char *path, char *buf, size_t size)
         if (output.empty()) 
             return -EINVAL; 
         if (output.front().length() < 3) return -EAGAIN;
+        if (output.front().compare(0,7,"error: ") == 0) return -EAGAIN;
         if (!check_exists(output.front()))
             return strerror_to_errno(output.front());
         res = output.front();
@@ -955,9 +998,10 @@ static struct fuse_operations adbfs_oper;
  */
 int main(int argc, char *argv[])
 {
+	putenv("LC_ALL=C");
     signal(SIGSEGV, handler);   // install our handler
     makeTmpDir();
-    memset(&adbfs_oper, sizeof(adbfs_oper), 0);
+    memset(&adbfs_oper, 0, sizeof(adbfs_oper));
     adbfs_oper.readdir= adb_readdir;
     adbfs_oper.getattr= adb_getattr;
     adbfs_oper.access= adb_access;
